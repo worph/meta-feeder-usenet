@@ -1,0 +1,65 @@
+[package]
+name = "usenet-feeder"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Usenet feeder sidecar: bridges a Usenet header scan we run OURSELVES into the
+# MetaMesh network. Unlike `meta-feeder-indexer` (which proxies an external
+# Newznab/torznab indexer) this feeder owns the metadata half — it reads an
+# nntmux sidecar's release catalog and mints a PORTABLE `nzb-posting` (0x1003)
+# cid from the article Message-IDs, so any peer with a plain NNTP provider can
+# redeem it without an indexer credential.
+#
+# It ADDS a Usenet metadata source alongside meta-feeder-indexer; it does not
+# replace it. Like every feeder it is meta-core-free + blockstore-free (the
+# gateway core owns hashing/seeding/store-back — see the gateway's invariant 10).
+#
+# See `meta-gateway/docs/others/self-hosted-usenet-indexer-study.md`.
+
+[lib]
+name = "usenet_feeder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "usenet-feeder"
+path = "src/main.rs"
+
+[dependencies]
+meta-feeder-sdk = { path = "../../crates/meta-feeder-sdk" }
+
+tokio = { version = "1.40", features = ["full"] }
+axum = { version = "0.7", features = ["json"] }
+anyhow = "1"
+async-trait = "0.1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+bytes = "1"
+futures = "0.3"
+regex = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+# nntmux's release catalog lives in MariaDB. `sqlx` in offline-free runtime mode
+# (no compile-time macro checking) so the build needs no live DB.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "mysql",
+    "macros",
+    "chrono",
+] }
+# nntmux stores each release's manifest as a gzipped NZB on disk; the ordered
+# Message-IDs survive ONLY there (it purges collections/binaries/parts after
+# writing the file), so reading + gunzipping it is the load-bearing path.
+flate2 = "1"
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+tokio = { version = "1.40", features = ["full", "test-util"] }

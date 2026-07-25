@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "feeder-plugin/*"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/worph/meta-feeder-usenet"
+
+# ---------------------------------------------------------------------------
+# Safety net for the yanked transitive `core2` dep, kept identical to the
+# meta-gateway / meta-feeder-* workspaces. Harmless (an unused-patch warning)
+# if the dep graph doesn't pull it; required if it does. Remove once
+# multihash-codetable drops the core2 dependency upstream.
+# ---------------------------------------------------------------------------
+[patch.crates-io]
+core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84b" }
