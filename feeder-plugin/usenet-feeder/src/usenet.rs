@@ -378,9 +378,12 @@ impl FeederPlugin for UsenetPlugin {
                     .with_help(
                         "Path to nntmux's NZB directory as mounted INTO this container \
                          — it must be the same volume nntmux's PATH_TO_NZBS points at. \
-                         Each release's ordered Message-IDs survive only in \
-                         <root>/<first-guid-char>/<guid>.nzb.gz, so a wrong path here \
-                         means every release resolves to NotFound.",
+                         Each release's ordered Message-IDs survive only in the on-disk \
+                         <guid>.nzb.gz, so a wrong path here means every release \
+                         resolves to NotFound. Point it at the STORE ROOT, not a shard: \
+                         nntmux nests each file one directory per leading guid character, \
+                         `nzbsplitlevel` deep (the image ships 4 → 9/7/a/2/97a2….nzb.gz), \
+                         and the depth is detected automatically.",
                     )
                     .required(),
             ],

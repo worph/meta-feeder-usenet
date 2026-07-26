@@ -36,12 +36,44 @@ pub struct Manifest {
     pub message_ids: Vec<String>,
 }
 
-/// nntmux shards its NZB storage one level deep by the guid's **first
-/// character** (`storage/nzb/a/abcdef….nzb.gz`). Mirrored here rather than
-/// globbed: a scan of a large store is slow and this is on the compute path.
+/// How deep we are willing to probe for a shard. nntmux caps its own loop at
+/// 32, but every real deployment sits in the low single digits and a guid is a
+/// 36-char uuid; 8 covers any sane `nzbsplitlevel` while keeping the probe below.
+const MAX_SPLIT_LEVEL: usize = 8;
+
+/// Build the path a release's `.nzb.gz` would occupy at an exact shard depth:
+/// one directory per leading guid character, mirroring nntmux's
+/// `NZB::buildNZBPath()` (`$nzbPath .= $releaseGuid[$i].'/'`).
+pub fn nzb_path_at(nzb_root: &Path, guid: &str, levels: usize) -> Option<PathBuf> {
+    if guid.is_empty() {
+        return None;
+    }
+    let mut path = nzb_root.to_path_buf();
+    for c in guid.chars().take(levels) {
+        path.push(c.to_string());
+    }
+    Some(path.join(format!("{guid}.nzb.gz")))
+}
+
+/// Locate a release's `.nzb.gz` in nntmux's sharded store.
+///
+/// **The shard depth is an nntmux *setting* (`settings.nzbsplitlevel`), not a
+/// constant.** The PHP code's own fallback is 1, but the maintainer image ships
+/// a database seeded with **4** (`storage/nzb/9/7/a/2/97a2….nzb.gz`) — so a
+/// hardcoded depth silently resolves to a path that does not exist, every
+/// release is skipped as "no .nzb.gz on disk yet", and the feeder reports zero
+/// hits while the scan is in fact working perfectly. An operator can also
+/// change the setting *after* files are written, leaving a store with mixed
+/// depths. So resolve by probing the candidate depths, deepest first.
+///
+/// Still not a glob: at most `MAX_SPLIT_LEVEL + 1` `stat` calls against exact
+/// paths, no directory enumeration — cheap enough for the compute path.
 pub fn nzb_path(nzb_root: &Path, guid: &str) -> Option<PathBuf> {
-    let first = guid.chars().next()?;
-    Some(nzb_root.join(first.to_string()).join(format!("{guid}.nzb.gz")))
+    let deepest = guid.chars().count().min(MAX_SPLIT_LEVEL);
+    (0..=deepest)
+        .rev()
+        .filter_map(|levels| nzb_path_at(nzb_root, guid, levels))
+        .find(|path| path.exists())
 }
 
 /// Read + gunzip a release's `.nzb.gz` and pull out its Message-IDs.
@@ -152,10 +184,47 @@ mod tests {
         assert!(ids.iter().all(|i| !i.contains('<') && !i.contains('>')));
     }
 
+    /// One directory per leading guid character, exactly as nntmux's
+    /// `buildNZBPath()` writes them.
     #[test]
-    fn nzb_path_shards_on_first_guid_char() {
-        let p = nzb_path(Path::new("/s/nzb"), "abc123").expect("path");
-        assert_eq!(p, Path::new("/s/nzb/a/abc123.nzb.gz"));
+    fn nzb_path_at_shards_one_dir_per_leading_char() {
+        let p = nzb_path_at(Path::new("/s/nzb"), "abc123", 4).expect("path");
+        assert_eq!(p, Path::new("/s/nzb/a/b/c/1/abc123.nzb.gz"));
+        let p0 = nzb_path_at(Path::new("/s/nzb"), "abc123", 0).expect("path");
+        assert_eq!(p0, Path::new("/s/nzb/abc123.nzb.gz"));
+    }
+
+    /// The regression this exists for: the maintainer image seeds
+    /// `nzbsplitlevel = 4`, so a resolver hardcoded to depth 1 finds nothing and
+    /// every real release is silently skipped as "no .nzb.gz on disk yet".
+    #[test]
+    fn nzb_path_finds_a_level_4_shard() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let guid = "97a2218c-d59b-4bc0-bb67-8a7d41e93fb5";
+        let deep = dir.path().join("9/7/a/2");
+        std::fs::create_dir_all(&deep).expect("mkdir");
+        std::fs::write(deep.join(format!("{guid}.nzb.gz")), b"x").expect("write");
+
+        let got = nzb_path(dir.path(), guid).expect("resolved");
+        assert_eq!(got, deep.join(format!("{guid}.nzb.gz")));
+    }
+
+    /// A store written at a shallower depth (or an operator who lowered
+    /// `nzbsplitlevel` after the fact) must still resolve.
+    #[test]
+    fn nzb_path_finds_a_level_1_shard() {
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(dir.path().join("a")).expect("mkdir");
+        std::fs::write(dir.path().join("a/abc123.nzb.gz"), b"x").expect("write");
+
+        let got = nzb_path(dir.path(), "abc123").expect("resolved");
+        assert_eq!(got, dir.path().join("a/abc123.nzb.gz"));
+    }
+
+    #[test]
+    fn nzb_path_is_none_when_absent_at_every_depth() {
+        let dir = tempfile::tempdir().expect("tmp");
+        assert!(nzb_path(dir.path(), "abc123").is_none());
     }
 
     /// A release row can exist before `createNZBs()` has written the manifest.
