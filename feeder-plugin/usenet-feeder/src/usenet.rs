@@ -186,6 +186,12 @@ impl UsenetPlugin {
         );
         if let Some(kind) = content_kind_for_category(r.category_id) {
             fields.insert("contentKind".to_string(), kind.to_string());
+            // The routing axis, co-written with the kind (METADATA_KEYS.md §1):
+            // `fileType` says what the bytes are, `domain` says which app wants
+            // the record. Without it the row never reaches a client wall.
+            if let Some(d) = meta_feeder_sdk::domain::domain_for_content_kind(kind) {
+                fields.insert("domain".to_string(), d.to_string());
+            }
         }
         if let Some(ts) = r.post_date {
             fields.insert("publishedAt".to_string(), ts.to_string());
