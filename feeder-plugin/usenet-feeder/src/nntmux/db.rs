@@ -200,7 +200,12 @@ pub fn file_type_for_category(category_id: i32) -> &'static str {
 pub fn content_kind_for_category(category_id: i32) -> Option<&'static str> {
     match category_id / 1000 {
         2 => Some("movie"),
-        5 => Some("tv"),
+        // ⚠ `episode`, not `tv`. `tv` is not a `contentKind` at all — it was a
+        // `domain` value, and it isn't even that any more (film + tv merged
+        // into `screen`, METADATA_KEYS.md §14.17). A kind outside the registry
+        // vocabulary resolves to no domain and no workForm, so the row is
+        // stamped with neither and is invisible to every client wall.
+        5 => Some("episode"),
         _ => None,
     }
 }
@@ -274,7 +279,7 @@ mod tests {
     #[test]
     fn content_kind_only_where_unambiguous() {
         assert_eq!(content_kind_for_category(2040), Some("movie"));
-        assert_eq!(content_kind_for_category(5040), Some("tv"));
+        assert_eq!(content_kind_for_category(5040), Some("episode"));
         assert_eq!(content_kind_for_category(3010), None);
         assert_eq!(content_kind_for_category(7020), None);
     }
