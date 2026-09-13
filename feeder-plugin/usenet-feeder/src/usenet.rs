@@ -23,24 +23,50 @@
 //! sha2-256 IPFS cid, publishes it as a first-class `fileType=nzb` meta-core
 //! record, and rewrites the field to that cid. Identical to how posters are
 //! handled. See the study's §5.3.
+//!
+//! # Redeeming external releases
+//!
+//! `compute_outcomes` also accepts an `nzb-release` (`0x1005`) cid — minted by
+//! meta-feeder-torznab from a Newznab search hit — and grabs its `.nzb` with the
+//! key configured for that indexer host ([`crate::newznab`]). It returns ONE
+//! `Sha2_256` outcome carrying the `.nzb` (head stripped, password kept); the
+//! gateway stores it under `/files/plugin/meta-feeder-usenet/`, writes its cid
+//! onto the release record as `manifest`, and merges the outcome record's
+//! `cids/<nzb-posting>` so the release becomes portable to any NNTP-only peer.
+//! Works without nntmux configured.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use meta_feeder_sdk::common::build_http_client;
 use meta_feeder_sdk::config::{ConfigField as F, ConfigSchema};
-use meta_feeder_sdk::hash::compute_nzb_posting_cid;
-use meta_feeder_sdk::plugin::{ConfigError, FeederPlugin, HashKind, HashOutcome};
+use meta_feeder_sdk::hash::{
+    codec_of, compute_ipfs_cid, compute_nzb_posting_cid, decode_nzb_release_cid, NZB_RELEASE_CODEC,
+};
+use meta_feeder_sdk::plugin::{ConfigError, FeederPlugin, HashKind, HashOutcome, RedeemClaim};
 use meta_feeder_sdk::query::GatewayQuery;
 use meta_feeder_sdk::types::{DiscoveryRecord, GatewayError, Hash, PluginHealth};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::newznab::{self, IndexerCred};
 use crate::nntmux::db::{content_kind_for_category, file_type_for_category, Db, Release};
 use crate::nntmux::nzb;
 
 pub const UPSTREAM_ID: &str = "usenet";
+
+/// `/files/plugin/<PACKAGE>/` — where the gateway stores the `.nzb` files this
+/// plugin redeems.
+pub const PACKAGE: &str = "meta-feeder-usenet";
+
+/// Indexers answer an anonymous `t=get` with `<error code="109" description=
+/// "Invalid User Agent"/>` (nzbgeek does), so always send a named client.
+const USER_AGENT: &str = concat!("meta-feeder-usenet/", env!("CARGO_PKG_VERSION"));
+
+/// Wall-clock budget for one `.nzb` grab. The viewer is waiting on it.
+const GRAB_TIMEOUT_SECS: u64 = 60;
 
 /// Operator-supplied settings, persisted to `<cache_dir>/config.json` by the
 /// SDK's config surface. Env is a **seed only** — the file wins on the next
@@ -52,6 +78,9 @@ pub struct Settings {
     /// Root of nntmux's NZB store, shared with the sidecar as a volume. The
     /// directory nntmux's `PATH_TO_NZBS` points at.
     pub nzb_root: String,
+    /// Per-host Newznab keys for redeeming `nzb-release` locators. Config page
+    /// only — no env seed.
+    pub indexers: Vec<IndexerCred>,
 }
 
 impl Settings {
@@ -60,6 +89,7 @@ impl Settings {
             db_url: std::env::var("NNTMUX_DB_URL").unwrap_or_default(),
             nzb_root: std::env::var("NNTMUX_NZB_PATH")
                 .unwrap_or_else(|_| "/nntmux-nzb".to_string()),
+            indexers: Vec::new(),
         }
     }
 
@@ -82,6 +112,13 @@ impl Settings {
                 self.nzb_root = s.to_string();
             }
         }
+        if let Some(rows) = v.get("indexers").and_then(|x| x.as_array()) {
+            self.indexers = rows
+                .iter()
+                .filter_map(|row| serde_json::from_value::<IndexerCred>(row.clone()).ok())
+                .filter(|c| !c.host.trim().is_empty() && !c.api_key.trim().is_empty())
+                .collect();
+        }
     }
 }
 
@@ -92,6 +129,12 @@ pub struct UsenetPlugin {
     /// — it soft-skips its upstream instead of failing to boot (invariant 10).
     db: Arc<RwLock<Option<Db>>>,
     nzb_root: PathBuf,
+    /// Client for `.nzb` grabs (named User-Agent, follows redirects so an HTML
+    /// landing page is detected rather than surfacing as a bare 302).
+    http: reqwest::Client,
+    /// `https` in production — a locator carries no scheme and every public
+    /// Newznab API is TLS. Tests point it at a plain-http mock.
+    grab_scheme: &'static str,
 }
 
 impl Default for UsenetPlugin {
@@ -106,7 +149,77 @@ impl UsenetPlugin {
             settings: Settings::default(),
             db: Arc::new(RwLock::new(None)),
             nzb_root: PathBuf::new(),
+            http: build_http_client(GRAB_TIMEOUT_SECS, USER_AGENT, None),
+            grab_scheme: "https",
         }
+    }
+
+    /// Grab over plain `http` instead of `https`. For tests against a local
+    /// mock indexer only — a locator carries no scheme, and a real indexer is TLS.
+    pub fn with_plain_http_grabs(mut self) -> Self {
+        self.grab_scheme = "http";
+        self
+    }
+
+    /// The configured key for an indexer authority, if any.
+    fn indexer_key(&self, authority: &str) -> Option<&str> {
+        let want = newznab::host_key(authority);
+        self.settings
+            .indexers
+            .iter()
+            .find(|c| newznab::host_key(&c.host) == want)
+            .map(|c| c.api_key.as_str())
+    }
+
+    /// Redeem an `nzb-release` locator: grab its `.nzb` with this feeder's key
+    /// for that host, strip the head (password kept), and mint the portable
+    /// `nzb-posting` cid from its Message-IDs.
+    ///
+    /// ⚠ **Spends indexer quota.** Reached only through `/compute`, which the
+    /// gateway calls on a real play and never for a release it already holds
+    /// the manifest of. `NotFound` = "not mine" (no key for that host), so the
+    /// gateway can try another claimer without anything being spent.
+    async fn redeem_release(&self, cid: &str) -> Result<Vec<HashOutcome>, GatewayError> {
+        let Some((api_base, id)) = decode_nzb_release_cid(cid) else {
+            return Err(GatewayError::NotFound);
+        };
+        let host = newznab::authority(&api_base);
+        let Some(key) = self.indexer_key(host) else {
+            debug!(target: "meta-feeder", %host, "usenet: no indexer key for this host; not ours to redeem");
+            return Err(GatewayError::NotFound);
+        };
+
+        info!(target: "meta-feeder", %host, %id, "usenet: grabbing .nzb (indexer quota)");
+        let raw = newznab::grab(&self.http, self.grab_scheme, &api_base, &id, key).await?;
+        let nzb = newznab::strip_head_keep_password(&raw)
+            .map_err(|e| GatewayError::Permanent(format!("nzb from {host} is not parseable: {e}")))?;
+        let message_ids = nzb::extract_message_ids(&nzb)
+            .map_err(|e| GatewayError::Permanent(format!("nzb from {host} is not parseable: {e}")))?;
+        if message_ids.is_empty() {
+            return Err(GatewayError::Permanent(format!(
+                "nzb from {host} has no segments"
+            )));
+        }
+
+        let posting = compute_nzb_posting_cid(&message_ids);
+        let mut fields = BTreeMap::new();
+        // Merged onto the release record by the gateway: the posting cid
+        // outranks the locator, so the release becomes redeemable by any peer
+        // with a plain NNTP provider — no indexer key anywhere after this grab.
+        fields.insert(format!("cids/{posting}"), "true".to_string());
+        fields.insert("segmentCount".to_string(), message_ids.len().to_string());
+
+        Ok(vec![HashOutcome {
+            hash: Hash(compute_ipfs_cid(&nzb)),
+            hash_kind: HashKind::Sha2_256,
+            bytes: Some(nzb.into()),
+            record: Some(DiscoveryRecord {
+                upstream_id: UPSTREAM_ID.to_string(),
+                record_id: cid.to_string(),
+                fields,
+            }),
+            file_extension: Some("nzb".to_string()),
+        }])
     }
 
     async fn db(&self) -> Result<Db, GatewayError> {
@@ -272,6 +385,10 @@ impl FeederPlugin for UsenetPlugin {
         if term.trim().is_empty() {
             return Ok(vec![]);
         }
+        if self.settings.db_url.is_empty() {
+            // Grab-only deployment (indexer keys, no nntmux): nothing to search.
+            return Ok(vec![]);
+        }
         let db = self.db().await?;
         let releases = db
             .search(term.trim(), max_results)
@@ -305,6 +422,11 @@ impl FeederPlugin for UsenetPlugin {
     }
 
     async fn compute_outcomes(&self, record_id: &str) -> Result<Vec<HashOutcome>, GatewayError> {
+        // An external release locator, not one of our nntmux guids. Checked
+        // first: it needs no database.
+        if codec_of(record_id) == Some(NZB_RELEASE_CODEC) {
+            return self.redeem_release(record_id).await;
+        }
         let db = self.db().await?;
         let release = db
             .by_guid(record_id)
@@ -357,12 +479,32 @@ impl FeederPlugin for UsenetPlugin {
     }
 
     fn health(&self) -> PluginHealth {
-        if self.settings.db_url.is_empty() {
+        if self.settings.db_url.is_empty() && self.settings.indexers.is_empty() {
             return PluginHealth::Degraded {
-                reason: "nntmux database not configured".into(),
+                reason: "neither an nntmux database nor an indexer key is configured".into(),
             };
         }
         PluginHealth::Ok
+    }
+
+    fn package(&self) -> Option<&'static str> {
+        Some(PACKAGE)
+    }
+
+    /// Claims `nzb-release` for every host with a key; nothing without keys.
+    fn redeems(&self) -> Vec<RedeemClaim> {
+        let mut hosts: Vec<String> = self
+            .settings
+            .indexers
+            .iter()
+            .map(|c| newznab::host_key(&c.host))
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        if hosts.is_empty() {
+            return Vec::new();
+        }
+        vec![RedeemClaim::nzb_release(hosts)]
     }
 
     fn served_file_types(&self) -> &'static [&'static str] {
@@ -380,10 +522,9 @@ impl FeederPlugin for UsenetPlugin {
                     .with_help(
                         "MariaDB DSN of the nntmux sidecar's catalog, e.g. \
                          mysql://nntmux:secret@nntmux-db:3306/nntmux. Blank → the \
-                         upstream soft-skips and this plugin reports Degraded. Takes \
+                         self-scan search is off (indexer-key redeems still work). Takes \
                          effect on the next feeder restart (no hot reload).",
-                    )
-                    .required(),
+                    ),
                 F::text("nzb_root", "NZB store path")
                     .with_help(
                         "Path to nntmux's NZB directory as mounted INTO this container \
@@ -394,8 +535,25 @@ impl FeederPlugin for UsenetPlugin {
                          nntmux nests each file one directory per leading guid character, \
                          `nzbsplitlevel` deep (the image ships 4 → 9/7/a/2/97a2….nzb.gz), \
                          and the depth is detected automatically.",
-                    )
-                    .required(),
+                    ),
+                F::record_array(
+                    "indexers",
+                    "Indexer keys (redeem nzb-release)",
+                    vec![
+                        F::text("host", "Host").required().with_help(
+                            "The indexer's bare host, e.g. api.nzbgeek.info — no scheme, no /api. \
+                             Matched against the host inside each nzb-release cid.",
+                        ),
+                        F::secret("api_key", "API key").required().with_help(
+                            "The indexer account's API key. Every grab spends that account's \
+                             daily download quota — once per release, on a real play only.",
+                        ),
+                    ],
+                )
+                .with_help(
+                    "Newznab keys used to grab the .nzb of releases minted by the torznab feeder \
+                     (Prowlarr search). Takes effect on the next feeder restart.",
+                ),
             ],
         }
     }
@@ -404,6 +562,7 @@ impl FeederPlugin for UsenetPlugin {
         serde_json::json!({
             "db_url": self.settings.db_url,
             "nzb_root": self.settings.nzb_root,
+            "indexers": self.settings.indexers,
         })
     }
 }

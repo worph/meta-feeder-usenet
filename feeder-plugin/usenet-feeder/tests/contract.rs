@@ -86,9 +86,31 @@ async fn health_degrades_gracefully_with_no_nntmux_configured() {
         "usenet plugin health entry should report Degraded, got {usenet_health}"
     );
     assert_eq!(
-        usenet_health["health"]["reason"], "nntmux database not configured",
+        usenet_health["health"]["reason"],
+        "neither an nntmux database nor an indexer key is configured",
         "got {usenet_health}"
     );
+}
+
+/// Unconfigured: the manifest still names the storage folder, but claims no
+/// redeems — there is no key to redeem anything with.
+#[tokio::test]
+async fn manifest_names_the_package_and_claims_nothing_without_keys() {
+    let (addr, _dir) = boot_feeder().await;
+    let manifest: serde_json::Value = reqwest::get(format!("http://{addr}/manifest"))
+        .await
+        .expect("manifest req")
+        .json()
+        .await
+        .expect("manifest json");
+    let usenet = manifest["plugins"]
+        .as_array()
+        .expect("plugins array")
+        .iter()
+        .find(|p| p["id"] == "usenet")
+        .expect("usenet entry");
+    assert_eq!(usenet["package"], "meta-feeder-usenet");
+    assert_eq!(usenet["redeems"], serde_json::json!([]));
 }
 
 /// Every seedable/resolvable field this feeder advertises resolving to must

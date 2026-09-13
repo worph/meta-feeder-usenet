@@ -3,10 +3,12 @@
 //!
 //! One plugin (`usenet`) served through [`meta_feeder_sdk::serve_feeders`].
 //!
-//! Operator config — the nntmux database URL and NZB store path — is read from
-//! the persisted `config.json` (dashboard-written), with the env vars below as a
-//! **first-boot seed only**: the file wins on the next restart, and there is no
-//! hot reload (gateway invariant 12).
+//! Operator config — the nntmux database URL and NZB store path, and the
+//! per-host Newznab indexer keys used to redeem `nzb-release` locators — is read
+//! from the persisted `config.json` (dashboard-written), with the env vars below
+//! as a **first-boot seed only**: the file wins on the next restart, and there
+//! is no hot reload (gateway invariant 12). Indexer keys have no env seed; set
+//! them on the config page.
 //!
 //! Env (seed): `NNTMUX_DB_URL`, `NNTMUX_NZB_PATH`.
 //! Env (infra): `META_FEEDER_HTTP_LISTEN` (default `0.0.0.0:8080`),

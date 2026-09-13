@@ -110,7 +110,7 @@ pub fn load(nzb_root: &Path, guid: &str) -> Result<Option<Manifest>> {
 /// meta-share would happily play. Surrounding `<>` are stripped if a producer
 /// included them — the mint normalises this too, but keeping the stored form
 /// canonical means the two never disagree about what was hashed.
-fn extract_message_ids(xml: &[u8]) -> Result<Vec<String>> {
+pub(crate) fn extract_message_ids(xml: &[u8]) -> Result<Vec<String>> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
 

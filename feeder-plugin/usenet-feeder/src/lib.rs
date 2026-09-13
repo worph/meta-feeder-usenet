@@ -9,6 +9,11 @@
 //!
 //! It ADDS a source alongside meta-feeder-indexer; it replaces nothing.
 //!
+//! It also **redeems** external Newznab releases: an `nzb-release` (`0x1005`)
+//! cid minted by meta-feeder-torznab is grabbed here, with this feeder's
+//! per-host indexer keys, when the gateway calls `/compute` on a real play
+//! ([`newznab`]). Indexer keys live on this feeder, not on meta-share.
+//!
 //! Like every feeder it is meta-core-free and blockstore-free: it finds records
 //! and serves bytes, and the gateway core owns hashing-into-the-blockstore, the
 //! meta-core store-back, and the libp2p wire (gateway invariant 10).
@@ -21,6 +26,9 @@ pub mod nntmux {
     pub mod db;
     pub mod nzb;
 }
+
+/// The `t=get` grab that redeems an external `nzb-release` locator.
+pub mod newznab;
 
 /// The `usenet` upstream itself.
 pub mod usenet;

@@ -3,9 +3,10 @@
 # usenet-feeder — Usenet feeder sidecar over an nntmux header-scan catalog.
 # Multi-stage build.
 #
-# Build context must be this repo root (packages/plugins/meta-feeder-usenet) so
-# the `meta-feeder-sdk` path dependency resolves. Same BuildKit cache-mount
-# strategy as the other feeders.
+# Build context must be this repo root (packages/plugins/meta-feeder-usenet).
+# `meta-feeder-sdk` is a git dependency pinned by tag, so the builder needs
+# network for `cargo fetch`. Same BuildKit cache-mount strategy as the other
+# feeders.
 #
 # This feeder talks to MariaDB (sqlx, rustls — no system MySQL client needed)
 # and reads nntmux's NZB store off a shared volume. It holds no media bytes.
@@ -22,7 +23,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml rust-toolchain.toml ./
-COPY crates/ crates/
 COPY feeder-plugin/ feeder-plugin/
 
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
