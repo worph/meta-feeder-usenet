@@ -49,6 +49,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use meta_feeder_sdk::common::build_http_client;
 use meta_feeder_sdk::config::{ConfigField as F, ConfigSchema};
+use meta_feeder_sdk::filename_meta::extract_season_episode;
 use meta_feeder_sdk::hash::{
     codec_of, compute_ipfs_cid, compute_nzb_posting_cid, decode_nzb_release_cid, NZB_RELEASE_CODEC,
 };
@@ -57,6 +58,7 @@ use meta_feeder_sdk::query::GatewayQuery;
 use meta_feeder_sdk::types::{DiscoveryRecord, GatewayError, Hash, PluginHealth};
 use tracing::{debug, info, warn};
 
+use crate::anchor::{self, CardBook, QueryAnchor};
 use crate::newznab::{self, IndexerCred};
 use crate::nntmux::api::{is_guid, NntmuxApi, DEFAULT_NNTMUX_URL};
 use crate::nntmux::cache::{NzbCache, Posting};
@@ -76,6 +78,9 @@ const USER_AGENT: &str = concat!("meta-feeder-usenet/", env!("CARGO_PKG_VERSION"
 /// Wall-clock budget for one `.nzb` grab. The viewer is waiting on it.
 const GRAB_TIMEOUT_SECS: u64 = 60;
 
+/// The `indexer` label when the config page sets none.
+pub const DEFAULT_INDEXER_NAME: &str = "nntmux";
+
 /// How often the nntmux reachability probe (`t=caps`, free) runs.
 const PROBE_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -94,6 +99,10 @@ pub struct Settings {
     /// Per-host Newznab keys for redeeming `nzb-release` locators. Config page
     /// only — no env seed.
     pub indexers: Vec<IndexerCred>,
+    /// The source name every record carries (`indexer`), shown beside
+    /// "nzbgeek.info"-style names in a client's source list. It names who
+    /// indexed the release — the bytes are Usenet's for every NZB source alike.
+    pub indexer_name: String,
 }
 
 impl Settings {
@@ -103,6 +112,7 @@ impl Settings {
             nntmux_url: env("NNTMUX_URL").unwrap_or_else(|| DEFAULT_NNTMUX_URL.to_string()),
             nntmux_api_key: env("NNTMUX_API_KEY").unwrap_or_default(),
             indexers: Vec::new(),
+            indexer_name: env("INDEXER_NAME").unwrap_or_else(|| DEFAULT_INDEXER_NAME.to_string()),
         }
     }
 
@@ -122,6 +132,9 @@ impl Settings {
         if let Some(s) = text("nntmux_api_key") {
             self.nntmux_api_key = s.to_string();
         }
+        if let Some(s) = text("indexer_name") {
+            self.indexer_name = s.to_string();
+        }
         if text("db_url").is_some() && self.nntmux_api_key.is_empty() {
             // A pre-1.1 config: the feeder read nntmux's database directly.
             warn!(
@@ -138,6 +151,20 @@ impl Settings {
                 .collect();
         }
     }
+}
+
+/// `nntmux (watch)` → `nntmux-watch`: a source-member leaf safe to split on `:`.
+fn source_slug(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_alphanumeric() || c == '.' {
+            out.extend(c.to_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() { DEFAULT_INDEXER_NAME.to_string() } else { out }
 }
 
 pub struct UsenetPlugin {
@@ -157,6 +184,9 @@ pub struct UsenetPlugin {
     /// `https` in production — a locator carries no scheme and every public
     /// Newznab API is TLS. Tests point it at a plain-http mock.
     grab_scheme: &'static str,
+    /// Show cards from the gateway's meta-core, for name-matching `tmdbid:`
+    /// queries ([`crate::anchor`]).
+    cards: Arc<CardBook>,
 }
 
 impl Default for UsenetPlugin {
@@ -174,6 +204,7 @@ impl UsenetPlugin {
             nntmux_problem: Arc::new(RwLock::new(None)),
             http: build_http_client(GRAB_TIMEOUT_SECS, USER_AGENT, None),
             grab_scheme: "https",
+            cards: Arc::new(CardBook::new(reqwest::Client::new(), None)),
         }
     }
 
@@ -284,6 +315,88 @@ impl UsenetPlugin {
             .ok_or_else(|| GatewayError::Permanent(format!("nzb of release {guid} has no segments")))
     }
 
+    /// Mint each hit's cid and build its record.
+    async fn mint_records(&self, releases: &[Release]) -> Vec<DiscoveryRecord> {
+        // Mint each hit's cid here — see the `record_for` doc for why this
+        // cannot wait for compute. A release whose `.nzb` can't be had is
+        // DROPPED rather than surfaced uncid'd: an unplayable row in the
+        // client's "raw sources" list is worse than one fewer row. Once nntmux
+        // says a daily cap is spent, stop asking for this query.
+        let mut out = Vec::with_capacity(releases.len());
+        let mut skipped = 0usize;
+        let mut capped = false;
+        for r in releases {
+            if capped {
+                skipped += 1;
+                continue;
+            }
+            match self.posting(&r.guid).await {
+                Ok(p) => out.push(self.record_for(r, Some(&p.cid))),
+                Err(GatewayError::RateLimited { .. }) => {
+                    capped = true;
+                    skipped += 1;
+                    warn!(target: "meta-feeder", "usenet: nntmux download cap reached — remaining hits skipped (raise the feeder user's role caps)");
+                }
+                Err(e) => {
+                    skipped += 1;
+                    debug!(target: "meta-feeder", guid = %r.guid, error = %e, "usenet: release skipped (no usable .nzb)");
+                }
+            }
+        }
+        if skipped > 0 {
+            debug!(target: "meta-feeder", hits = out.len(), skipped, "usenet: releases skipped");
+        }
+        out
+    }
+
+    /// A `tmdbid:` query: read the show's card, search NNTmux by its title,
+    /// keep the releases whose names match and whose numbering agrees, and
+    /// stamp them as a title match. No card → nothing to match by → `[]`.
+    async fn handle_anchored(
+        &self,
+        anchor: &QueryAnchor,
+        max_results: usize,
+    ) -> Result<Vec<DiscoveryRecord>, GatewayError> {
+        let Some(card) = self.cards.card_for(anchor).await else {
+            debug!(target: "meta-feeder", tmdbid = %anchor.tmdbid, "usenet: no card on meta-core for this id; nothing to match by name");
+            return Ok(vec![]);
+        };
+        let card = card.as_ref();
+        let (api, _) = self.nntmux()?;
+        let mut seen = std::collections::HashSet::new();
+        let mut matched: Vec<Release> = Vec::new();
+        let mut looked = 0usize;
+        for term in card.search_terms() {
+            let releases = api.search(&term, max_results).await.inspect_err(|e| self.note_problem(e))?;
+            *self.nntmux_problem.write().unwrap() = None;
+            looked += releases.len();
+            // Filter BEFORE minting: minting downloads the `.nzb`, and a
+            // release that is not this show must cost nothing.
+            for r in releases {
+                let kind_ok = !matches!(
+                    (card.kind, content_kind_for_category(r.category_id)),
+                    (anchor::ShowKind::Tv, Some("movie")) | (anchor::ShowKind::Movie, Some("episode"))
+                );
+                if kind_ok
+                    && anchor::name_matches(&r.search_name, &card.names)
+                    && anchor::numbering_agrees(&r.search_name, anchor)
+                    && seen.insert(r.guid.clone())
+                {
+                    matched.push(r);
+                }
+            }
+        }
+        let mut out = self.mint_records(&matched).await;
+        for rec in &mut out {
+            anchor::stamp_match(&mut rec.fields, anchor, card);
+        }
+        debug!(
+            target: "meta-feeder", tmdbid = %anchor.tmdbid, show = %card.names[0], looked, matched = out.len(),
+            "usenet: name-matched search"
+        );
+        Ok(out)
+    }
+
     /// Build the discovery record for one release. Metadata only — the bytes
     /// live on Usenet and are fetched by meta-share at playback, never by us.
     ///
@@ -334,27 +447,43 @@ impl UsenetPlugin {
             "fileType".to_string(),
             file_type_for_category(r.category_id).to_string(),
         );
-        if let Some(kind) = content_kind_for_category(r.category_id) {
-            fields.insert("contentKind".to_string(), kind.to_string());
+        let kind = content_kind_for_category(r.category_id);
+        // Numbering from the release name, for TV releases (and uncategorised
+        // ones that plainly carry an `SxxEyy`). A season pack gets the season
+        // only and becomes `pack`, as the torznab feeder files them.
+        let se = extract_season_episode(&r.search_name);
+        let tv = kind == Some("episode") || (kind.is_none() && se.season_explicit);
+        let kind = if tv && se.is_pack { Some("pack") } else { kind };
+        if tv {
+            if let Some(s) = &se.season {
+                fields.insert("season".to_string(), s.clone());
+            }
+            if !se.is_pack {
+                if let Some(e) = &se.episode {
+                    fields.insert("episode".to_string(), e.clone());
+                }
+            }
+        }
+        if let Some(kind) = kind {
             // The routing axes, co-written with the kind (METADATA_KEYS.md §1):
             // `fileType` says what the bytes are, `domain` says which app wants
             // the record, `workForm` whether it stands alone or is one
             // instalment. Without the domain the row never reaches a wall.
-            if let Some(d) = meta_feeder_sdk::domain::domain_for_content_kind(kind) {
-                fields.insert("domain".to_string(), d.to_string());
-            }
-            if let Some(wf) = meta_feeder_sdk::domain::work_form_for_content_kind(kind) {
-                fields.insert("workForm".to_string(), wf.to_string());
-            }
+            anchor::set_kind(&mut fields, kind);
         }
         if let Some(ts) = r.post_date {
             fields.insert("publishedAt".to_string(), ts.to_string());
         }
-        // Provenance: this catalog is ours, not an external indexer's. Kept
-        // distinct from indexer-feeder's `indexer` field on purpose — an
-        // operator reading a record should be able to tell at a glance whether
-        // its metadata came from a third party or from our own scan.
+        // Provenance: who indexed it. `indexer` is the name a client shows
+        // beside "nzbgeek.info", and a plain `source/<name>` member carries it
+        // into the source facets the way the torznab feeder files its indexer
+        // (`source/nzb.life`). `source/gateway:usenet-scan` stays as the
+        // selector for everything this feeder published.
+        let name = self.settings.indexer_name.trim();
+        let name = if name.is_empty() { DEFAULT_INDEXER_NAME } else { name };
+        fields.insert("indexer".to_string(), name.to_string());
         fields.insert("source/gateway:usenet-scan".to_string(), "true".to_string());
+        fields.insert(format!("source/{}", source_slug(name)), "true".to_string());
         DiscoveryRecord {
             upstream_id: UPSTREAM_ID.to_string(),
             record_id: r.guid.clone(),
@@ -372,6 +501,10 @@ impl FeederPlugin for UsenetPlugin {
     fn configure(&mut self, cache_dir: &Path) -> Result<(), ConfigError> {
         let mut settings = Settings::from_env();
         settings.merge_file(cache_dir);
+        // The gateway's meta-core, where show cards live (`crate::anchor`).
+        // Unset → show-page queries simply get no name matches.
+        let meta_core_url = std::env::var("META_CORE_URL").ok();
+        self.cards = Arc::new(CardBook::new(build_http_client(10, USER_AGENT, None), meta_core_url));
 
         if settings.nntmux_api_key.is_empty() {
             // Soft-skip, not a hard failure: serve /health, report Degraded.
@@ -424,15 +557,20 @@ impl FeederPlugin for UsenetPlugin {
         query: &GatewayQuery,
         max_results: usize,
     ) -> Result<Vec<DiscoveryRecord>, GatewayError> {
+        if self.nntmux.is_none() {
+            // Grab-only deployment (indexer keys, no nntmux): nothing to search.
+            return Ok(vec![]);
+        }
+        // A show page's query (`tmdbid:<id> season:<n> …`, no free text): match
+        // releases to the show BY NAME, against its card — see `crate::anchor`.
+        if let Some(anchor) = QueryAnchor::from_query(query) {
+            return self.handle_anchored(&anchor, max_results).await;
+        }
         // `free_text` is the bare-word leaves only — the structured filters
         // (contentKind:, fileType:) are the gateway's routing gate, not a search
         // term, and passing them to a LIKE would match nothing.
         let term = query.free_text.clone();
         if term.trim().is_empty() {
-            return Ok(vec![]);
-        }
-        if self.nntmux.is_none() {
-            // Grab-only deployment (indexer keys, no nntmux): nothing to search.
             return Ok(vec![]);
         }
         let (api, _) = self.nntmux()?;
@@ -441,37 +579,8 @@ impl FeederPlugin for UsenetPlugin {
             .await
             .inspect_err(|e| self.note_problem(e))?;
         *self.nntmux_problem.write().unwrap() = None;
-
-        // Mint each hit's cid here — see the `record_for` doc for why this
-        // cannot wait for compute. A release whose `.nzb` can't be had is
-        // DROPPED rather than surfaced uncid'd: an unplayable row in the
-        // client's "raw sources" list is worse than one fewer row. Once nntmux
-        // says a daily cap is spent, stop asking for this query.
-        let mut out = Vec::with_capacity(releases.len());
-        let mut skipped = 0usize;
-        let mut capped = false;
-        for r in &releases {
-            if capped {
-                skipped += 1;
-                continue;
-            }
-            match self.posting(&r.guid).await {
-                Ok(p) => out.push(self.record_for(r, Some(&p.cid))),
-                Err(GatewayError::RateLimited { .. }) => {
-                    capped = true;
-                    skipped += 1;
-                    warn!(target: "meta-feeder", "usenet: nntmux download cap reached — remaining hits skipped (raise the feeder user's role caps)");
-                }
-                Err(e) => {
-                    skipped += 1;
-                    debug!(target: "meta-feeder", guid = %r.guid, error = %e, "usenet: release skipped (no usable .nzb)");
-                }
-            }
-        }
-        debug!(
-            target: "meta-feeder", %term, hits = out.len(), skipped,
-            "usenet: nntmux search"
-        );
+        let out = self.mint_records(&releases).await;
+        debug!(target: "meta-feeder", %term, hits = out.len(), "usenet: nntmux search");
         Ok(out)
     }
 
@@ -588,10 +697,16 @@ impl FeederPlugin for UsenetPlugin {
                     ),
                 F::secret("nntmux_api_key", "nntmux API key")
                     .with_help(
-                        "API key of the nntmux user this feeder searches as — the NNTmux app's \
-                         `metamesh` user, whose role has raised daily caps (see the NNTmux app's \
-                         install tips for how to read it). Blank → the self-scan search is off \
+                        "API key of the nntmux user this feeder searches as. Create one with \
+                         `docker exec nntmux-scanner nntmux-setup api-user metamesh` (raised daily \
+                         caps) and paste the key it prints. Blank → the self-scan search is off \
                          (indexer-key redeems still work).",
+                    ),
+                F::text("indexer_name", "Source name")
+                    .with_help(
+                        "How this feeder's releases are labelled in a client's source list, \
+                         beside names like nzbgeek.info (default: nntmux). Takes effect on the \
+                         next feeder restart.",
                     ),
                 F::record_array(
                     "indexers",
@@ -619,7 +734,54 @@ impl FeederPlugin for UsenetPlugin {
         serde_json::json!({
             "nntmux_url": self.settings.nntmux_url,
             "nntmux_api_key": self.settings.nntmux_api_key,
+            "indexer_name": self.settings.indexer_name,
             "indexers": self.settings.indexers,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_slug_keeps_a_leaf_safe_name() {
+        assert_eq!(source_slug("nntmux"), "nntmux");
+        assert_eq!(source_slug("NNTmux (watch)"), "nntmux-watch");
+        assert_eq!(source_slug("my:indexer"), "my-indexer");
+        assert_eq!(source_slug("  "), "nntmux");
+    }
+
+    fn release(name: &str, category: i32) -> Release {
+        Release {
+            guid: "0f0e5b2c-1111-4c5e-9d6b-2a3b4c5d6e7f".into(),
+            search_name: name.into(),
+            category_id: category,
+            size: 1,
+            post_date: None,
+        }
+    }
+
+    #[test]
+    fn records_carry_the_indexer_label_and_numbering() {
+        let mut p = UsenetPlugin::new();
+        p.settings.indexer_name = "nntmux".into();
+        let f = p.record_for(&release("Trash.Truck.S02E16.Mint.Choco.Boom.1080p.NF.WEB-DL-NTb", 5040), None).fields;
+        assert_eq!(f["indexer"], "nntmux");
+        assert_eq!(f["source/gateway:usenet-scan"], "true");
+        assert_eq!(f["source/nntmux"], "true");
+        assert_eq!(f["season"], "2");
+        assert_eq!(f["episode"], "16");
+        assert_eq!(f["contentKind"], "episode");
+
+        let pack = p.record_for(&release("Wonkas.The.Golden.Ticket.S01.1080p.WEB.H264-MIXED", 10), None).fields;
+        assert_eq!(pack["contentKind"], "pack");
+        assert_eq!(pack["domain"], "screen");
+        assert_eq!(pack["season"], "1");
+        assert!(!pack.contains_key("episode"));
+
+        let film = p.record_for(&release("Some.Film.2020.1080p.BluRay.x264-GRP", 2040), None).fields;
+        assert!(!film.contains_key("season"));
+        assert_eq!(film["contentKind"], "movie");
     }
 }

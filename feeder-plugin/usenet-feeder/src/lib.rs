@@ -34,4 +34,6 @@ pub mod nntmux {
 pub mod newznab;
 
 /// The `usenet` upstream itself.
+pub mod anchor;
+
 pub mod usenet;
