@@ -6,10 +6,16 @@
 //! `nzb-release` (`0x1005`) cid that *embeds that indexer's host*. Only a peer
 //! holding that indexer's credential can ever redeem it.
 //!
-//! This feeder scans Usenet itself, so it already holds the article Message-IDs
-//! at collation time — no grab, no scrape. That lets it mint a **portable**
-//! `nzb-posting` (`0x1003`) cid: a digest over the Message-ID set, embedding no
-//! host, redeemable by any peer with a plain NNTP provider.
+//! This feeder fronts a Usenet scan we run ourselves (the NNTmux app), so the
+//! `.nzb` of every release is ours to fetch, unmetered by any third party. That
+//! lets it mint a **portable** `nzb-posting` (`0x1003`) cid: a digest over the
+//! Message-ID set, embedding no host, redeemable by any peer with a plain NNTP
+//! provider.
+//!
+//! nntmux is reached **only over its Newznab API** ([`crate::nntmux::api`]) with
+//! a key on this feeder's config page — the same contract the torznab feeder
+//! uses with Prowlarr. Each release's `.nzb` is downloaded once and cached
+//! ([`crate::nntmux::cache`]).
 //!
 //! The two coexist. This ADDS a Usenet metadata source; it removes nothing.
 //!
@@ -36,8 +42,9 @@
 //! Works without nntmux configured.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use meta_feeder_sdk::common::build_http_client;
@@ -48,11 +55,12 @@ use meta_feeder_sdk::hash::{
 use meta_feeder_sdk::plugin::{ConfigError, FeederPlugin, HashKind, HashOutcome, RedeemClaim};
 use meta_feeder_sdk::query::GatewayQuery;
 use meta_feeder_sdk::types::{DiscoveryRecord, GatewayError, Hash, PluginHealth};
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::newznab::{self, IndexerCred};
-use crate::nntmux::db::{content_kind_for_category, file_type_for_category, Db, Release};
+use crate::nntmux::api::{is_guid, NntmuxApi, DEFAULT_NNTMUX_URL};
+use crate::nntmux::cache::{NzbCache, Posting};
+use crate::nntmux::catalog::{content_kind_for_category, file_type_for_category, Release};
 use crate::nntmux::nzb;
 
 pub const UPSTREAM_ID: &str = "usenet";
@@ -68,16 +76,21 @@ const USER_AGENT: &str = concat!("meta-feeder-usenet/", env!("CARGO_PKG_VERSION"
 /// Wall-clock budget for one `.nzb` grab. The viewer is waiting on it.
 const GRAB_TIMEOUT_SECS: u64 = 60;
 
+/// How often the nntmux reachability probe (`t=caps`, free) runs.
+const PROBE_INTERVAL: Duration = Duration::from_secs(300);
+
 /// Operator-supplied settings, persisted to `<cache_dir>/config.json` by the
 /// SDK's config surface. Env is a **seed only** — the file wins on the next
 /// restart (invariant 12; there is no hot reload).
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
-    /// `mysql://user:pass@host:3306/nntmux`
-    pub db_url: String,
-    /// Root of nntmux's NZB store, shared with the sidecar as a volume. The
-    /// directory nntmux's `PATH_TO_NZBS` points at.
-    pub nzb_root: String,
+    /// Base URL of our nntmux (the NNTmux app's web container), e.g.
+    /// `http://nntmux`. The API path (`/api/v1/api`) is appended.
+    pub nntmux_url: String,
+    /// API key of the nntmux user this feeder searches as (the NNTmux app
+    /// provisions a `metamesh` user with raised daily caps). Blank → the
+    /// self-scan search is off; indexer-key redeems still work.
+    pub nntmux_api_key: String,
     /// Per-host Newznab keys for redeeming `nzb-release` locators. Config page
     /// only — no env seed.
     pub indexers: Vec<IndexerCred>,
@@ -85,10 +98,10 @@ pub struct Settings {
 
 impl Settings {
     fn from_env() -> Self {
+        let env = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         Self {
-            db_url: std::env::var("NNTMUX_DB_URL").unwrap_or_default(),
-            nzb_root: std::env::var("NNTMUX_NZB_PATH")
-                .unwrap_or_else(|_| "/nntmux-nzb".to_string()),
+            nntmux_url: env("NNTMUX_URL").unwrap_or_else(|| DEFAULT_NNTMUX_URL.to_string()),
+            nntmux_api_key: env("NNTMUX_API_KEY").unwrap_or_default(),
             indexers: Vec::new(),
         }
     }
@@ -102,15 +115,20 @@ impl Settings {
             warn!(target: "meta-feeder", path = %path.display(), "config.json is not valid json; using env seed");
             return;
         };
-        if let Some(s) = v.get("db_url").and_then(|x| x.as_str()) {
-            if !s.is_empty() {
-                self.db_url = s.to_string();
-            }
+        let text = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty());
+        if let Some(s) = text("nntmux_url") {
+            self.nntmux_url = s.to_string();
         }
-        if let Some(s) = v.get("nzb_root").and_then(|x| x.as_str()) {
-            if !s.is_empty() {
-                self.nzb_root = s.to_string();
-            }
+        if let Some(s) = text("nntmux_api_key") {
+            self.nntmux_api_key = s.to_string();
+        }
+        if text("db_url").is_some() && self.nntmux_api_key.is_empty() {
+            // A pre-1.1 config: the feeder read nntmux's database directly.
+            warn!(
+                target: "meta-feeder",
+                "usenet: config.json still carries the pre-1.1 `db_url` — nntmux is now reached over \
+                 its Newznab API; set `nntmux_api_key` (and `nntmux_url`) on the config page"
+            );
         }
         if let Some(rows) = v.get("indexers").and_then(|x| x.as_array()) {
             self.indexers = rows
@@ -124,11 +142,15 @@ impl Settings {
 
 pub struct UsenetPlugin {
     settings: Settings,
-    /// `None` until a successful connect. A feeder with unreachable config
-    /// **must still serve `/health`** so the gateway's `depends_on` is satisfied
-    /// — it soft-skips its upstream instead of failing to boot (invariant 10).
-    db: Arc<RwLock<Option<Db>>>,
-    nzb_root: PathBuf,
+    /// `None` when no nntmux key is configured (grab-only deployment).
+    nntmux: Option<Arc<NntmuxApi>>,
+    /// `.nzb` per release guid, under the plugin's state dir.
+    cache: Option<Arc<NzbCache>>,
+    /// Why nntmux is unusable right now (unreachable, key refused), for
+    /// `health()`. A feeder with unreachable config **must still serve
+    /// `/health`** — it soft-skips its upstream instead of failing to boot
+    /// (invariant 10).
+    nntmux_problem: Arc<RwLock<Option<String>>>,
     /// Client for `.nzb` grabs (named User-Agent, follows redirects so an HTML
     /// landing page is detected rather than surfacing as a bare 302).
     http: reqwest::Client,
@@ -147,8 +169,9 @@ impl UsenetPlugin {
     pub fn new() -> Self {
         Self {
             settings: Settings::default(),
-            db: Arc::new(RwLock::new(None)),
-            nzb_root: PathBuf::new(),
+            nntmux: None,
+            cache: None,
+            nntmux_problem: Arc::new(RwLock::new(None)),
             http: build_http_client(GRAB_TIMEOUT_SECS, USER_AGENT, None),
             grab_scheme: "https",
         }
@@ -222,29 +245,43 @@ impl UsenetPlugin {
         }])
     }
 
-    async fn db(&self) -> Result<Db, GatewayError> {
-        self.db
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| GatewayError::Permanent("nntmux database not configured".into()))
+    fn nntmux(&self) -> Result<(&NntmuxApi, &NzbCache), GatewayError> {
+        match (&self.nntmux, &self.cache) {
+            (Some(api), Some(cache)) => Ok((api.as_ref(), cache.as_ref())),
+            _ => Err(GatewayError::Permanent("no nntmux API key configured".into())),
+        }
     }
 
-    /// Mint a release's `nzb-posting` cid by reading its manifest off disk.
-    ///
-    /// `None` when the `.nzb.gz` is absent (a release row can exist before
-    /// `createNZBs()` has written it) or unreadable — the caller then emits a
-    /// record without a cid, which is honest: we genuinely cannot address that
-    /// posting yet.
-    fn posting_cid(&self, guid: &str) -> Option<String> {
-        match nzb::load(&self.nzb_root, guid) {
-            Ok(Some(m)) => Some(compute_nzb_posting_cid(&m.message_ids)),
-            Ok(None) => None,
-            Err(e) => {
-                warn!(target: "meta-feeder", %guid, error = %e, "usenet: manifest unreadable; record will carry no cid");
-                None
-            }
+    fn note_problem(&self, e: &GatewayError) {
+        if let GatewayError::Permanent(msg) = e {
+            *self.nntmux_problem.write().unwrap() = Some(msg.clone());
         }
+    }
+
+    /// A release's `.nzb`: from the cache, else downloaded from nntmux once
+    /// (one `downloadrequests` unit) and cached.
+    async fn manifest(&self, guid: &str) -> Result<Vec<u8>, GatewayError> {
+        let (api, cache) = self.nntmux()?;
+        if let Some(xml) = cache.get(guid) {
+            return Ok(xml);
+        }
+        let xml = api.nzb(guid).await.inspect_err(|e| self.note_problem(e))?;
+        if let Err(e) = cache.put(guid, &xml) {
+            warn!(target: "meta-feeder", %guid, error = %e, "usenet: could not cache the .nzb (will re-download)");
+        }
+        Ok(xml)
+    }
+
+    /// Mint a release's `nzb-posting` identity from its `.nzb`.
+    async fn posting(&self, guid: &str) -> Result<Posting, GatewayError> {
+        let (_, cache) = self.nntmux()?;
+        if let Some(p) = cache.known(guid) {
+            return Ok(p);
+        }
+        let xml = self.manifest(guid).await?;
+        cache
+            .posting(guid, &xml)
+            .ok_or_else(|| GatewayError::Permanent(format!("nzb of release {guid} has no segments")))
     }
 
     /// Build the discovery record for one release. Metadata only — the bytes
@@ -257,9 +294,9 @@ impl UsenetPlugin {
     /// title renders but is unplayable. `nzb-release` (`0x1005`) avoids this
     /// for free because its cid is derivable from `{host, id}` alone; ours is a
     /// digest over the Message-ID set, so it has to be minted from the manifest
-    /// — which is a **local file read**, no network and no indexer grab, and
-    /// therefore fine to do per search hit. Caught by an end-to-end play from
-    /// meta-watch that landed on "Unavailable".
+    /// — one `/getnzb` on our own nntmux the first time a release is seen, then
+    /// the cache. Caught by an end-to-end play from meta-watch that landed on
+    /// "Unavailable".
     fn record_for(&self, r: &Release, cid: Option<&str>) -> DiscoveryRecord {
         let mut fields: BTreeMap<String, String> = BTreeMap::new();
         // The bare-cid key-set (`cids/<cid>` = "true") — the ONLY shape
@@ -335,40 +372,49 @@ impl FeederPlugin for UsenetPlugin {
     fn configure(&mut self, cache_dir: &Path) -> Result<(), ConfigError> {
         let mut settings = Settings::from_env();
         settings.merge_file(cache_dir);
-        self.nzb_root = PathBuf::from(&settings.nzb_root);
 
-        if settings.db_url.is_empty() {
+        if settings.nntmux_api_key.is_empty() {
             // Soft-skip, not a hard failure: serve /health, report Degraded.
             warn!(
                 target: "meta-feeder",
-                "usenet: no nntmux database url configured — upstream will soft-skip \
-                 (set it in the feeder's config page, or seed NNTMUX_DB_URL)"
+                "usenet: no nntmux API key configured — the self-scan search is off \
+                 (set it on the feeder's config page: the NNTmux app's `metamesh` user key)"
             );
             self.settings = settings;
             return Ok(());
         }
 
-        // Connect eagerly so a bad url is visible at boot rather than on the
-        // first query, but never fatally — the sidecar may still be starting.
-        let url = settings.db_url.clone();
-        let slot = self.db.clone();
+        let api = Arc::new(NntmuxApi::new(self.http.clone(), &settings.nntmux_url, &settings.nntmux_api_key));
+        self.cache = Some(Arc::new(NzbCache::new(&cache_dir.join("nntmux-nzb"))));
+        info!(target: "meta-feeder", nntmux = api.base(), "usenet: searching nntmux over its Newznab API");
+
+        // Reachability, now and periodically — never fatal: nntmux may still be
+        // starting (it takes minutes on a large store).
+        let probe = Arc::clone(&api);
+        let problem = Arc::clone(&self.nntmux_problem);
         tokio::spawn(async move {
-            match Db::connect(&url).await {
-                Ok(db) => {
-                    match db.release_count().await {
-                        Ok(0) => warn!(
-                            target: "meta-feeder",
-                            "usenet: nntmux catalog is EMPTY — check the scan actually ran \
-                             (PATH_TO_NZBS must be non-empty, and groups need active=1)"
-                        ),
-                        Ok(n) => info!(target: "meta-feeder", releases = n, "usenet: nntmux catalog connected"),
-                        Err(e) => warn!(target: "meta-feeder", error = %e, "usenet: catalog count failed"),
+            loop {
+                match probe.caps().await {
+                    Ok(()) => {
+                        let mut p = problem.write().unwrap();
+                        // A refused key is learned from real calls; only clear
+                        // what this probe can vouch for (reachability).
+                        if p.as_deref().is_some_and(|m| m.contains("unreachable") || m.contains("t=caps")) {
+                            *p = None;
+                        }
                     }
-                    *slot.write().await = Some(db);
+                    Err(e) => {
+                        warn!(target: "meta-feeder", nntmux = probe.base(), error = %e, "usenet: nntmux not reachable");
+                        *problem.write().unwrap() = Some(match e {
+                            GatewayError::Permanent(m) => m,
+                            other => format!("nntmux {} unreachable: {other}", probe.base()),
+                        });
+                    }
                 }
-                Err(e) => warn!(target: "meta-feeder", error = %e, "usenet: nntmux connect failed; upstream soft-skips"),
+                tokio::time::sleep(PROBE_INTERVAL).await;
             }
         });
+        self.nntmux = Some(api);
         self.settings = settings;
         Ok(())
     }
@@ -385,39 +431,47 @@ impl FeederPlugin for UsenetPlugin {
         if term.trim().is_empty() {
             return Ok(vec![]);
         }
-        if self.settings.db_url.is_empty() {
+        if self.nntmux.is_none() {
             // Grab-only deployment (indexer keys, no nntmux): nothing to search.
             return Ok(vec![]);
         }
-        let db = self.db().await?;
-        let releases = db
+        let (api, _) = self.nntmux()?;
+        let releases = api
             .search(term.trim(), max_results)
             .await
-            .map_err(|e| GatewayError::Transient(format!("nntmux search: {e}")))?;
+            .inspect_err(|e| self.note_problem(e))?;
+        *self.nntmux_problem.write().unwrap() = None;
 
-        // Mint each hit's cid here, from its on-disk manifest — see the
-        // `record_for` doc for why this cannot wait for compute. A release
-        // whose manifest isn't written yet is DROPPED rather than surfaced
-        // uncid'd: an unplayable row in the client's "raw sources" list is
-        // worse than one fewer row.
+        // Mint each hit's cid here — see the `record_for` doc for why this
+        // cannot wait for compute. A release whose `.nzb` can't be had is
+        // DROPPED rather than surfaced uncid'd: an unplayable row in the
+        // client's "raw sources" list is worse than one fewer row. Once nntmux
+        // says a daily cap is spent, stop asking for this query.
         let mut out = Vec::with_capacity(releases.len());
         let mut skipped = 0usize;
+        let mut capped = false;
         for r in &releases {
-            match self.posting_cid(&r.guid) {
-                Some(cid) => out.push(self.record_for(r, Some(&cid))),
-                None => skipped += 1,
+            if capped {
+                skipped += 1;
+                continue;
+            }
+            match self.posting(&r.guid).await {
+                Ok(p) => out.push(self.record_for(r, Some(&p.cid))),
+                Err(GatewayError::RateLimited { .. }) => {
+                    capped = true;
+                    skipped += 1;
+                    warn!(target: "meta-feeder", "usenet: nntmux download cap reached — remaining hits skipped (raise the feeder user's role caps)");
+                }
+                Err(e) => {
+                    skipped += 1;
+                    debug!(target: "meta-feeder", guid = %r.guid, error = %e, "usenet: release skipped (no usable .nzb)");
+                }
             }
         }
         debug!(
             target: "meta-feeder", %term, hits = out.len(), skipped,
-            "usenet: catalog search"
+            "usenet: nntmux search"
         );
-        if skipped > 0 {
-            debug!(
-                target: "meta-feeder", skipped,
-                "usenet: releases skipped — no .nzb.gz on disk yet (scan still collating?)"
-            );
-        }
         Ok(out)
     }
 
@@ -427,20 +481,20 @@ impl FeederPlugin for UsenetPlugin {
         if codec_of(record_id) == Some(NZB_RELEASE_CODEC) {
             return self.redeem_release(record_id).await;
         }
-        let db = self.db().await?;
-        let release = db
-            .by_guid(record_id)
+        if !is_guid(record_id) {
+            return Err(GatewayError::NotFound);
+        }
+        let (api, _) = self.nntmux()?;
+        let release = api
+            .details(record_id)
             .await
-            .map_err(|e| GatewayError::Transient(format!("nntmux lookup: {e}")))?
+            .inspect_err(|e| self.note_problem(e))?
             .ok_or(GatewayError::NotFound)?;
 
-        // The Message-IDs survive only in the on-disk `.nzb.gz` — nntmux purges
-        // collections/binaries/parts once it has written the file.
-        let manifest = nzb::load(&self.nzb_root, record_id)
-            .map_err(|e| GatewayError::Permanent(format!("nzb read: {e}")))?
-            .ok_or(GatewayError::NotFound)?;
-
-        let cid = compute_nzb_posting_cid(&manifest.message_ids);
+        // The Message-IDs survive only in the release's `.nzb` — nntmux purges
+        // collections/binaries/parts once it has written it.
+        let posting = self.posting(record_id).await?;
+        let cid = posting.cid;
 
         // Same cid the search path already published for this release — the
         // client is committing to a cid it saw in the results, so the two must
@@ -450,7 +504,7 @@ impl FeederPlugin for UsenetPlugin {
         // it must be on the search path, not only here.
         record
             .fields
-            .insert("segmentCount".to_string(), manifest.message_ids.len().to_string());
+            .insert("segmentCount".to_string(), posting.segment_count.to_string());
 
         Ok(vec![HashOutcome {
             hash: Hash(cid),
@@ -468,21 +522,28 @@ impl FeederPlugin for UsenetPlugin {
     /// names the stored blob correctly).
     async fn get_blob(&self, cid: &str) -> Option<Vec<u8>> {
         let guid = cid.strip_suffix(".nzb").unwrap_or(cid);
-        match nzb::load(&self.nzb_root, guid) {
-            Ok(Some(m)) => Some(m.xml),
-            Ok(None) => None,
+        if !is_guid(guid) {
+            return None;
+        }
+        // Normally a cache hit: the search that published `manifest_url` has
+        // already downloaded it.
+        match self.manifest(guid).await {
+            Ok(xml) => Some(xml),
             Err(e) => {
-                warn!(target: "meta-feeder", %guid, error = %e, "usenet: blob read failed");
+                warn!(target: "meta-feeder", %guid, error = %e, "usenet: .nzb unavailable for seeding");
                 None
             }
         }
     }
 
     fn health(&self) -> PluginHealth {
-        if self.settings.db_url.is_empty() && self.settings.indexers.is_empty() {
+        if self.nntmux.is_none() && self.settings.indexers.is_empty() {
             return PluginHealth::Degraded {
-                reason: "neither an nntmux database nor an indexer key is configured".into(),
+                reason: "neither an nntmux API key nor an indexer key is configured".into(),
             };
+        }
+        if let Some(problem) = self.nntmux_problem.read().unwrap().clone() {
+            return PluginHealth::Degraded { reason: problem };
         }
         PluginHealth::Ok
     }
@@ -518,23 +579,19 @@ impl FeederPlugin for UsenetPlugin {
     fn config_schema(&self) -> ConfigSchema {
         ConfigSchema {
             fields: vec![
-                F::text("db_url", "nntmux database URL")
+                F::text("nntmux_url", "nntmux URL")
                     .with_help(
-                        "MariaDB DSN of the nntmux sidecar's catalog, e.g. \
-                         mysql://nntmux:secret@nntmux-db:3306/nntmux. Blank → the \
-                         self-scan search is off (indexer-key redeems still work). Takes \
-                         effect on the next feeder restart (no hot reload).",
+                        "Base URL of your NNTmux app as this feeder reaches it (default \
+                         http://nntmux, the app's container on the shared network). The \
+                         Newznab API path is added automatically. Takes effect on the next \
+                         feeder restart.",
                     ),
-                F::text("nzb_root", "NZB store path")
+                F::secret("nntmux_api_key", "nntmux API key")
                     .with_help(
-                        "Path to nntmux's NZB directory as mounted INTO this container \
-                         — it must be the same volume nntmux's PATH_TO_NZBS points at. \
-                         Each release's ordered Message-IDs survive only in the on-disk \
-                         <guid>.nzb.gz, so a wrong path here means every release \
-                         resolves to NotFound. Point it at the STORE ROOT, not a shard: \
-                         nntmux nests each file one directory per leading guid character, \
-                         `nzbsplitlevel` deep (the image ships 4 → 9/7/a/2/97a2….nzb.gz), \
-                         and the depth is detected automatically.",
+                        "API key of the nntmux user this feeder searches as — the NNTmux app's \
+                         `metamesh` user, whose role has raised daily caps (see the NNTmux app's \
+                         install tips for how to read it). Blank → the self-scan search is off \
+                         (indexer-key redeems still work).",
                     ),
                 F::record_array(
                     "indexers",
@@ -560,8 +617,8 @@ impl FeederPlugin for UsenetPlugin {
 
     fn config_values(&self) -> serde_json::Value {
         serde_json::json!({
-            "db_url": self.settings.db_url,
-            "nzb_root": self.settings.nzb_root,
+            "nntmux_url": self.settings.nntmux_url,
+            "nntmux_api_key": self.settings.nntmux_api_key,
             "indexers": self.settings.indexers,
         })
     }

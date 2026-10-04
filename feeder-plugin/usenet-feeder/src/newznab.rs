@@ -9,6 +9,10 @@
 //!
 //! Moved here from meta-share's `nzb/manifest_resolve.rs::grab_newznab`: the
 //! indexer keys now live on this feeder, meta-share keeps only the NNTP pool.
+//!
+//! The error handling ([`fetch_nzb`], [`newznab_error`], [`classify`]) is shared
+//! with the client for our own nntmux ([`crate::nntmux::api`]), which speaks the
+//! same Newznab dialect.
 
 use std::borrow::Cow;
 
@@ -155,44 +159,41 @@ pub async fn grab(
 ) -> Result<Vec<u8>, GatewayError> {
     let base = api_base.trim_end_matches('/');
     let url = format!("{scheme}://{base}/api?t=get&id={id}&apikey={api_key}");
+    fetch_nzb(http, &url, base).await
+}
+
+/// GET an `.nzb` and turn every way a Newznab server can refuse into the feeder
+/// error contract: HTTP status, an HTML page (login wall, Cloudflare, a
+/// permalink host), an oversize body, or a `<error code>` answered as `200`.
+///
+/// `label` names the server in error messages; `url` is never echoed (it
+/// carries the API key). Shared by the external-indexer redeem ([`grab`]) and
+/// the nntmux client ([`crate::nntmux::api`]).
+pub async fn fetch_nzb(http: &reqwest::Client, url: &str, label: &str) -> Result<Vec<u8>, GatewayError> {
     let resp = http
-        .get(&url)
+        .get(url)
         .send()
         .await
-        .map_err(|e| GatewayError::Transient(format!("newznab grab {base}: {}", e.without_url())))?;
+        .map_err(|e| GatewayError::Transient(format!("newznab grab {label}: {}", e.without_url())))?;
 
     let status = resp.status();
     if !status.is_success() {
-        return Err(match status.as_u16() {
-            404 => GatewayError::NotFound,
-            429 => GatewayError::RateLimited {
-                retry_after_s: resp
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(QUOTA_RETRY_SECS),
-            },
-            _ if status.is_server_error() => {
-                GatewayError::Transient(format!("newznab grab {base}: HTTP {status}"))
-            }
-            _ => GatewayError::Permanent(format!("newznab grab {base}: HTTP {status}")),
-        });
+        return Err(status_error(&resp, label));
     }
 
     let body = resp
         .bytes()
         .await
-        .map_err(|e| GatewayError::Transient(format!("newznab grab {base}: {}", e.without_url())))?;
+        .map_err(|e| GatewayError::Transient(format!("newznab grab {label}: {}", e.without_url())))?;
     if body.len() > MAX_NZB_BYTES {
         return Err(GatewayError::Permanent(format!(
-            "newznab grab {base}: .nzb is {} bytes, over the {MAX_NZB_BYTES}-byte ceiling",
+            "newznab grab {label}: .nzb is {} bytes, over the {MAX_NZB_BYTES}-byte ceiling",
             body.len()
         )));
     }
     if looks_like_html(&body) {
         return Err(GatewayError::Permanent(format!(
-            "indexer {base} answered the .nzb grab with an HTML page — check the API base and key"
+            "indexer {label} answered the .nzb grab with an HTML page — check the API base and key"
         )));
     }
     let text: Cow<str> = String::from_utf8_lossy(&body);
@@ -200,6 +201,26 @@ pub async fn grab(
         return Err(classify(&err));
     }
     Ok(text.into_owned().into_bytes())
+}
+
+/// The feeder error for a non-2xx Newznab answer.
+pub fn status_error(resp: &reqwest::Response, label: &str) -> GatewayError {
+    let status = resp.status();
+    match status.as_u16() {
+        404 => GatewayError::NotFound,
+        429 => GatewayError::RateLimited {
+            retry_after_s: resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(QUOTA_RETRY_SECS),
+        },
+        _ if status.is_server_error() => {
+            GatewayError::Transient(format!("newznab {label}: HTTP {status}"))
+        }
+        _ => GatewayError::Permanent(format!("newznab {label}: HTTP {status}")),
+    }
 }
 
 /// Drop the NZB `<head>` except `<meta type="password">`.

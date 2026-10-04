@@ -7,8 +7,7 @@
 //! the soft-skip invariant every feeder must honour (gateway invariant 10: a
 //! feeder with insufficient config still serves `/health` so the gateway's
 //! `depends_on` is satisfied, rather than failing to boot). Live search/mint
-//! are not driven here — they need a running nntmux sidecar with real data;
-//! that path is exercised against `docker-compose.feeder-usenet.yml`.
+//! are driven against a mock nntmux in `tests/nntmux_api.rs`.
 
 use std::net::SocketAddr;
 
@@ -17,7 +16,7 @@ use usenet_feeder::usenet::UsenetPlugin;
 
 async fn boot_feeder() -> (SocketAddr, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
-    // Deliberately no NNTMUX_DB_URL / NNTMUX_NZB_PATH — the "operator hasn't
+    // Deliberately no NNTMUX_API_KEY — the "operator hasn't
     // configured this feeder yet" boot state. `configure()` must not error.
     let plugin = UsenetPlugin::new();
     let configured = configure_plugins(vec![Box::new(plugin)], dir.path()).expect("configure");
@@ -59,7 +58,7 @@ async fn manifest_advertises_usenet() {
 /// server reporting `degraded` — never a crash, never a hang, never `ok`
 /// (which would lie about being able to serve real content). This is what
 /// lets the gateway's `depends_on: condition: service_healthy` succeed even
-/// before an operator has filled in nntmux's db_url on the feeder's config
+/// before an operator has filled in the nntmux API key on the feeder's config
 /// page.
 #[tokio::test]
 async fn health_degrades_gracefully_with_no_nntmux_configured() {
@@ -87,7 +86,7 @@ async fn health_degrades_gracefully_with_no_nntmux_configured() {
     );
     assert_eq!(
         usenet_health["health"]["reason"],
-        "neither an nntmux database nor an indexer key is configured",
+        "neither an nntmux API key nor an indexer key is configured",
         "got {usenet_health}"
     );
 }

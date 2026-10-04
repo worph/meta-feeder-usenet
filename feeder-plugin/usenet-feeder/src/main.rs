@@ -1,16 +1,16 @@
-//! `usenet-feeder` — single-source Usenet feeder sidecar over an nntmux
-//! header-scan catalog.
+//! `usenet-feeder` — single-source Usenet feeder sidecar over our own nntmux
+//! indexer (the NNTmux app), reached over its Newznab API.
 //!
 //! One plugin (`usenet`) served through [`meta_feeder_sdk::serve_feeders`].
 //!
-//! Operator config — the nntmux database URL and NZB store path, and the
+//! Operator config — the nntmux base URL and API key, and the
 //! per-host Newznab indexer keys used to redeem `nzb-release` locators — is read
 //! from the persisted `config.json` (dashboard-written), with the env vars below
 //! as a **first-boot seed only**: the file wins on the next restart, and there
 //! is no hot reload (gateway invariant 12). Indexer keys have no env seed; set
 //! them on the config page.
 //!
-//! Env (seed): `NNTMUX_DB_URL`, `NNTMUX_NZB_PATH`.
+//! Env (seed): `NNTMUX_URL` (default `http://nntmux`), `NNTMUX_API_KEY`.
 //! Env (infra): `META_FEEDER_HTTP_LISTEN` (default `0.0.0.0:8080`),
 //! `META_FEEDER_STATE_DIR` (default `/data/meta-feeder`), `RUST_LOG`.
 
